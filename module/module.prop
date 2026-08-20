@@ -1,0 +1,6 @@
+id=nm_scanner
+name=NM/ZM Conflict Scanner
+version=v1.0
+versionCode=1
+author=chandr1000
+description=Scan-only tool. Detects shell commands in installed modules that may conflict with NoMount/ZeroMount. Runs during install, prints results, then aborts (no module is left behind).

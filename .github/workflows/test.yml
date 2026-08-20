@@ -1,0 +1,358 @@
+name: Test
+
+# Runs the scanner against synthetic fixtures on every push/PR to main.
+# Verifies that:
+#   1. The scanner correctly identifies HIGH/MED/LOW/INFO patterns
+#   2. Standalone mode returns exit code 2 when conflicts are found
+#   3. Standalone mode returns exit code 0 when no conflicts are found
+#   4. Recovery rejection (BOOTMODE=false) aborts cleanly in sourced mode
+#   5. POSIX sh compatibility (runs under dash, not just bash)
+#
+# Free for public repos (unlimited minutes).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Scanner Tests
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [ dash, sh ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dash (POSIX reference shell)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dash
+
+      - name: Set up test fixtures
+        run: |
+          # Create synthetic module fixtures under a temp /data/adb/modules-like
+          # tree. Each fixture has a known set of conflict patterns.
+          FIXTURE_ROOT="$HOME/fixtures"
+          mkdir -p "$FIXTURE_ROOT/data/adb/modules"/{good_module,systemless_ok,bind_mount_module,sed_chcon_module,remount_module,empty_module}
+
+          # good_module: uses staging dir, lets NM/ZM do the redirection
+          cat > "$FIXTURE_ROOT/data/adb/modules/good_module/service.sh" <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          chmod 755 "$MODDIR/system/bin/my_binary"
+          chown root:shell "$MODDIR/system/bin/my_binary"
+          chcon u:object_r:system_file:s0 "$MODDIR/system/bin/my_binary"
+          EOF
+
+          # bind_mount_module: classic bind mounts + overlay
+          cat > "$FIXTURE_ROOT/data/adb/modules/bind_mount_module/post-fs-data.sh" <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          mount --bind $MODDIR/system/etc/hosts /system/etc/hosts
+          mount --bind /data/local/tmp/custom.prop /system/build.prop
+          mount -t overlay overlay -o lowerdir=/system,upperdir=/data/overlay /system
+          EOF
+
+          # sed_chcon_module: late chcon and sed -i on system paths
+          cat > "$FIXTURE_ROOT/data/adb/modules/sed_chcon_module/service.sh" <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          chcon u:object_r:system_file:s0 /system/bin/my_injected_binary
+          sed -i 's/redirect/allow/g' /system/etc/some_config.xml
+          echo "127.0.0.1 localhost" > /system/etc/hosts
+          restorecon -R /system/bin/
+          EOF
+
+          # remount_module: tries to remount /system rw
+          cat > "$FIXTURE_ROOT/data/adb/modules/remount_module/post-fs-data.sh" <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          mount -o remount,rw /system
+          mount -o remount,rw /vendor
+          cp $MODDIR/staging/libfoo.so /system/lib64/libfoo.so
+          mkdir -p /system/etc/my_dir
+          rm /system/etc/old_file.conf
+          EOF
+
+          # systemless_ok: NM-compatible, uses nm add correctly
+          cat > "$FIXTURE_ROOT/data/adb/modules/systemless_ok/service.sh" <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          chmod 755 "$MODDIR/staging/my_binary"
+          chcon u:object_r:system_file:s0 "$MODDIR/staging/my_binary"
+          nm add /system/bin/my_binary "$MODDIR/staging/my_binary"
+          EOF
+
+          # empty_module: no scripts at all
+          mkdir -p "$FIXTURE_ROOT/data/adb/modules/empty_module"
+
+          # Strip leading whitespace from heredocs (the indentation above is cosmetic)
+          find "$FIXTURE_ROOT" -name '*.sh' -exec sed -i 's/^[[:space:]]*//' {} +
+
+          # Make fixtures discoverable to subsequent steps
+          echo "FIXTURE_ROOT=$FIXTURE_ROOT" >> "$GITHUB_ENV"
+
+      - name: Test 1 — Standalone scan finds conflicts (exit code 2)
+        run: |
+          echo "::group::Standalone scan output"
+          ${{ matrix.shell }} nm-scan.sh "$FIXTURE_ROOT/data/adb/modules" 2>&1 | tee /tmp/scan_out.txt
+          exit_code=${PIPESTATUS[0]}
+          echo "::endgroup"
+          echo "Exit code: $exit_code"
+
+          if [ "$exit_code" != "2" ]; then
+            echo "::error::Expected exit code 2, got $exit_code"
+            exit 1
+          fi
+
+          # Verify expected modules are flagged
+          for mod in bind_mount_module sed_chcon_module remount_module systemless_ok; do
+            if ! grep -q "$mod" /tmp/scan_out.txt; then
+              echo "::error::Expected module '$mod' to be flagged, but not found in output"
+              exit 1
+            fi
+          done
+
+          # Verify good_module is NOT flagged (no conflict lines under its name)
+          if grep -A1 "good_module" /tmp/scan_out.txt | grep -qE '^[[:space:]]+[X!\-+]'; then
+            echo "::error::good_module should not have any conflicts, but flagged lines were found"
+            exit 1
+          fi
+
+          echo "::notice::Test 1 passed: standalone scan correctly detected conflicts"
+
+      - name: Test 2 — Standalone scan on empty dir returns 0
+        run: |
+          mkdir -p /tmp/empty_mods
+          ${{ matrix.shell }} nm-scan.sh /tmp/empty_mods > /tmp/empty_out.txt 2>&1
+          exit_code=$?
+          echo "Exit code: $exit_code"
+
+          if [ "$exit_code" != "0" ]; then
+            echo "::error::Expected exit code 0 for empty modules dir, got $exit_code"
+            cat /tmp/empty_out.txt
+            exit 1
+          fi
+
+          if ! grep -q "No conflict patterns detected" /tmp/empty_out.txt; then
+            echo "::error::Expected 'No conflict patterns detected' message"
+            cat /tmp/empty_out.txt
+            exit 1
+          fi
+
+          echo "::notice::Test 2 passed: empty dir returns 0"
+
+      - name: Test 3 — Standalone scan on missing path returns 1
+        run: |
+          # Disable errexit so the intentional non-zero exit from the scanner
+          # does not abort this step before we can capture and assert on it.
+          set +e
+          sh nm-scan.sh /nonexistent/path > /tmp/missing_out.txt 2>&1
+          exit_code=$?
+          set -e
+          echo "Exit code: $exit_code"
+
+          if [ "$exit_code" != "1" ]; then
+            echo "::error::Expected exit code 1 for missing path, got $exit_code"
+            cat /tmp/missing_out.txt
+            exit 1
+          fi
+
+          if ! grep -q "Modules directory not found" /tmp/missing_out.txt; then
+            echo "::error::Expected 'Modules directory not found' message"
+            cat /tmp/missing_out.txt
+            exit 1
+          fi
+
+          echo "::notice::Test 3 passed: missing path returns 1"
+
+      - name: Test 4 — Sourced mode (simulating customize.sh env, BOOTMODE=true)
+        run: |
+          cat > /tmp/test_sourced.sh <<'OUTER'
+          #!/bin/sh
+          ui_print() { printf 'UI: %s\n' "$1"; }
+          abort()    { printf 'UI: [ABORT] %s\n' "$1"; exit 1; }
+
+          BOOTMODE=true
+          KSU=true
+          KSU_VER="v1.0.0"
+          API=34
+          ARCH=arm64
+          MODPATH=/tmp/fake_modpath
+          mkdir -p "$MODPATH"
+          cp nm-scan.sh "$MODPATH/nm-scan.sh"
+          cp module/customize.sh "$MODPATH/customize.sh"
+
+          # Patch customize.sh to use fixture path instead of /data/adb/modules
+          sed 's|/data/adb/modules|'"$FIXTURE_ROOT"'/data/adb/modules|g' \
+              "$MODPATH/customize.sh" > /tmp/test_customize.sh
+
+          . /tmp/test_customize.sh
+          OUTER
+          chmod +x /tmp/test_sourced.sh
+
+          # Disable errexit: customize.sh calls abort() at the end which exits 1
+          set +e
+          ${{ matrix.shell }} /tmp/test_sourced.sh 2>&1 | tee /tmp/sourced_out.txt
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          echo "sourced exit code: $exit_code"
+
+          # Verify ui_print was used (every line starts with UI:)
+          non_ui_lines=$(grep -vE '^UI: ' /tmp/sourced_out.txt | grep -v '^$' | wc -l)
+          if [ "$non_ui_lines" -gt 0 ]; then
+            echo "::error::Found $non_ui_lines lines NOT going through ui_print"
+            grep -vE '^UI: ' /tmp/sourced_out.txt | grep -v '^$'
+            exit 1
+          fi
+
+          # Verify KSU environment was detected
+          if ! grep -q 'Environment : KernelSU' /tmp/sourced_out.txt; then
+            echo "::error::Expected KernelSU env to be detected"
+            cat /tmp/sourced_out.txt
+            exit 1
+          fi
+
+          # Verify conflicts were found in sourced mode
+          if ! grep -q 'SCAN COMPLETE: conflicts found' /tmp/sourced_out.txt; then
+            echo "::error::Expected 'SCAN COMPLETE: conflicts found' message"
+            cat /tmp/sourced_out.txt
+            exit 1
+          fi
+
+          # Verify abort was called at the end
+          if ! grep -q '\[ABORT\] Scan-only module' /tmp/sourced_out.txt; then
+            echo "::error::Expected abort() call at end"
+            cat /tmp/sourced_out.txt
+            exit 1
+          fi
+
+          echo "::notice::Test 4 passed: sourced mode works correctly"
+
+      - name: Test 5 — Recovery rejection (BOOTMODE=false)
+        run: |
+          cat > /tmp/test_recovery.sh <<'OUTER'
+          #!/bin/sh
+          ui_print() { printf 'UI: %s\n' "$1"; }
+          abort()    { printf 'UI: [ABORT] %s\n' "$1"; exit 1; }
+
+          BOOTMODE=false
+          MODPATH=/tmp/fake_modpath
+          mkdir -p "$MODPATH"
+          cp nm-scan.sh "$MODPATH/nm-scan.sh"
+          cp module/customize.sh "$MODPATH/customize.sh"
+
+          . "$MODPATH/customize.sh"
+          OUTER
+          chmod +x /tmp/test_recovery.sh
+
+          # Disable errexit: customize.sh abort() exits 1 by design
+          set +e
+          ${{ matrix.shell }} /tmp/test_recovery.sh 2>&1 | tee /tmp/recovery_out.txt
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          echo "recovery exit code: $exit_code"
+
+          # Verify the recovery rejection message was printed
+          if ! grep -q 'RECOVERY FLASHING NOT SUPPORTED' /tmp/recovery_out.txt; then
+            echo "::error::Expected 'RECOVERY FLASHING NOT SUPPORTED' message"
+            cat /tmp/recovery_out.txt
+            exit 1
+          fi
+
+          # Verify abort was called
+          if ! grep -q '\[ABORT\] Recovery flashing is not supported' /tmp/recovery_out.txt; then
+            echo "::error::Expected abort() call for recovery flashing"
+            cat /tmp/recovery_out.txt
+            exit 1
+          fi
+
+          # Verify the scanner was NOT run (no scan output)
+          if grep -q 'Phase 1: discovering script files' /tmp/recovery_out.txt; then
+            echo "::error::Scanner should NOT have run in recovery mode"
+            cat /tmp/recovery_out.txt
+            exit 1
+          fi
+
+          echo "::notice::Test 5 passed: recovery rejection works correctly"
+
+      - name: Test 6 — ZIP structure validity
+        run: |
+          # Build the ZIP exactly as the release workflow would
+          mkdir -p /tmp/test_zip
+          ( cd module && zip -r /tmp/test_zip/nm-scanner-module-test.zip . )
+
+          # Verify required files are present at ZIP root
+          for required in customize.sh module.prop nm-scan.sh \
+                          META-INF/com/google/android/update-binary \
+                          META-INF/com/google/android/updater-script; do
+            if ! unzip -l /tmp/test_zip/nm-scanner-module-test.zip | grep -q " $required$"; then
+              echo "::error::Required file missing from ZIP: $required"
+              unzip -l /tmp/test_zip/nm-scanner-module-test.zip
+              exit 1
+            fi
+          done
+
+          # Verify no parent directory in ZIP (files must be at root)
+          if unzip -l /tmp/test_zip/nm-scanner-module-test.zip | grep -q 'module/'; then
+            echo "::error::ZIP should not contain a 'module/' parent directory"
+            unzip -l /tmp/test_zip/nm-scanner-module-test.zip
+            exit 1
+          fi
+
+          echo "::notice::Test 6 passed: ZIP structure is valid"
+
+      - name: Test 7 — module.prop format
+        run: |
+          # Per KernelSU docs:
+          # - id must match ^[a-zA-Z][a-zA-Z0-9._-]+$
+          # - versionCode must be an integer
+          # - LF line endings (not CRLF)
+          if file module/module.prop | grep -q CRLF; then
+            echo "::error::module.prop must use LF line endings, not CRLF"
+            exit 1
+          fi
+
+          id=$(grep -E '^id=' module/module.prop | head -1 | sed 's/^id=//')
+          if ! echo "$id" | grep -qE '^[a-zA-Z][a-zA-Z0-9._-]+$'; then
+            echo "::error::module id '$id' does not match required pattern"
+            exit 1
+          fi
+
+          versionCode=$(grep -E '^versionCode=' module/module.prop | head -1 | sed 's/^versionCode=//')
+          if ! echo "$versionCode" | grep -qE '^[0-9]+$'; then
+            echo "::error::versionCode '$versionCode' is not an integer"
+            exit 1
+          fi
+
+          # Verify all required fields are present
+          for field in id name version versionCode author description; do
+            if ! grep -q "^${field}=" module/module.prop; then
+              echo "::error::Required field '$field' missing from module.prop"
+              exit 1
+            fi
+          done
+
+          echo "::notice::Test 7 passed: module.prop is valid"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Test Results (${{ matrix.shell }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "All 7 tests passed under ${{ matrix.shell }}." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Some tests failed. Check the logs above." >> "$GITHUB_STEP_SUMMARY"
+          fi

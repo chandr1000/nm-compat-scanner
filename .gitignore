@@ -1,0 +1,31 @@
+# Build artifacts
+*.zip
+*.tar.gz
+/dist/
+/build/
+
+# Test artifacts
+/tmp/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local env / secrets
+.env
+.env.local
+*.pem
+*_PAT*
+*_TOKEN*
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*

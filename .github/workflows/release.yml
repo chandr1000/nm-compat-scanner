@@ -1,0 +1,122 @@
+name: Release
+
+# Option A: tag-triggered.
+# Push a tag matching v* (e.g. v1.0, v1.1.0) to trigger:
+#   1. Build a flashable ZIP from the module/ subdirectory
+#   2. Create a GitHub Release attached to that tag
+#   3. Upload the ZIP as a release asset
+#
+# Usage:
+#   git tag v1.0
+#   git push origin v1.0
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required to create the release and upload assets
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so we can read tag annotations
+
+      - name: Set up zip utility
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zip
+
+      - name: Read module metadata
+        id: meta
+        run: |
+          # Parse module.prop for version + name
+          # Format: id=..., name=..., version=v..., versionCode=...
+          MODULE_PROP="module/module.prop"
+          if [ ! -f "$MODULE_PROP" ]; then
+            echo "::error::module/module.prop not found"
+            exit 1
+          fi
+
+          # POSIX-friendly parse (no awk arrays)
+          id=$(grep -E '^id=' "$MODULE_PROP"      | head -1 | sed 's/^id=//')
+          name=$(grep -E '^name=' "$MODULE_PROP"  | head -1 | sed 's/^name=//')
+          version=$(grep -E '^version=' "$MODULE_PROP"     | head -1 | sed 's/^version=//')
+          versionCode=$(grep -E '^versionCode=' "$MODULE_PROP" | head -1 | sed 's/^versionCode=//')
+
+          echo "module_id=$id"               >> "$GITHUB_OUTPUT"
+          echo "module_name=$name"          >> "$GITHUB_OUTPUT"
+          echo "module_version=$version"    >> "$GITHUB_OUTPUT"
+          echo "module_version_code=$versionCode" >> "$GITHUB_OUTPUT"
+
+          # Also export as env for later steps
+          echo "MODULE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "MODULE_NAME=$name"       >> "$GITHUB_ENV"
+
+          echo "::notice::Module: $name $version (code $versionCode)"
+
+      - name: Build flashable ZIP
+        id: build
+        run: |
+          # Output ZIP filename: nm-scanner-module-<tag-or-version>.zip
+          TAG="${GITHUB_REF#refs/tags/}"
+          ZIP_NAME="nm-scanner-module-${TAG}.zip"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "::notice::Building $ZIP_NAME"
+
+          # ZIP must contain files at the root level (no parent dir),
+          # because Magisk/KSU installers expect META-INF/, module.prop,
+          # customize.sh at the ZIP root.
+          mkdir -p dist
+          ( cd module && zip -r "../dist/$ZIP_NAME" . )
+
+          # Verify ZIP structure
+          echo "::group::ZIP contents"
+          unzip -l "dist/$ZIP_NAME"
+          echo "::endgroup"
+
+          # Verify required files are at ZIP root
+          for required in customize.sh module.prop nm-scan.sh META-INF/com/google/android/update-binary; do
+            if ! unzip -l "dist/$ZIP_NAME" | grep -q "^[^/]*$required$"; then
+              echo "::error::Required file missing from ZIP root: $required"
+              exit 1
+            fi
+          done
+
+          # Compute SHA256 for traceability
+          cd dist
+          sha256sum "$ZIP_NAME" > "$ZIP_NAME.sha256"
+          ls -la
+          cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ env.MODULE_NAME }} ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/${{ steps.build.outputs.zip_name }}
+            dist/${{ steps.build.outputs.zip_name }}.sha256
+          body: |
+            ## ${{ env.MODULE_NAME }} ${{ env.MODULE_VERSION }}
+
+            **Tag**: `${{ github.ref_name }}`
+            **Module version code**: `${{ steps.meta.outputs.module_version_code }}`
+
+            ### Install
+            1. Download the ZIP below
+            2. Open Magisk or KernelSU manager
+            3. **Modules → Install from storage → select the ZIP**
+            4. Watch the install log for scan results
+            5. Install ends with `abort "Scan-only module - nothing to install."` — this is expected
+
+            ### What's new
+            See generated changelog below.
