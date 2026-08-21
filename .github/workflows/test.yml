@@ -106,7 +106,7 @@ jobs:
       - name: Test 1 — Standalone scan finds conflicts (exit code 2)
         run: |
           echo "::group::Standalone scan output"
-          ${{ matrix.shell }} nm-scan.sh "$FIXTURE_ROOT/data/adb/modules" 2>&1 | tee /tmp/scan_out.txt
+          ${{ matrix.shell }} module/nm-scan.sh "$FIXTURE_ROOT/data/adb/modules" 2>&1 | tee /tmp/scan_out.txt
           exit_code=${PIPESTATUS[0]}
           echo "::endgroup"
           echo "Exit code: $exit_code"
@@ -135,7 +135,7 @@ jobs:
       - name: Test 2 — Standalone scan on empty dir returns 0
         run: |
           mkdir -p /tmp/empty_mods
-          ${{ matrix.shell }} nm-scan.sh /tmp/empty_mods > /tmp/empty_out.txt 2>&1
+          ${{ matrix.shell }} module/nm-scan.sh /tmp/empty_mods > /tmp/empty_out.txt 2>&1
           exit_code=$?
           echo "Exit code: $exit_code"
 
@@ -158,7 +158,7 @@ jobs:
           # Disable errexit so the intentional non-zero exit from the scanner
           # does not abort this step before we can capture and assert on it.
           set +e
-          sh nm-scan.sh /nonexistent/path > /tmp/missing_out.txt 2>&1
+          sh module/nm-scan.sh /nonexistent/path > /tmp/missing_out.txt 2>&1
           exit_code=$?
           set -e
           echo "Exit code: $exit_code"
@@ -191,7 +191,7 @@ jobs:
           ARCH=arm64
           MODPATH=/tmp/fake_modpath
           mkdir -p "$MODPATH"
-          cp nm-scan.sh "$MODPATH/nm-scan.sh"
+          cp module/nm-scan.sh "$MODPATH/nm-scan.sh"
           cp module/customize.sh "$MODPATH/customize.sh"
 
           # Patch customize.sh to use fixture path instead of /data/adb/modules
@@ -250,7 +250,7 @@ jobs:
           BOOTMODE=false
           MODPATH=/tmp/fake_modpath
           mkdir -p "$MODPATH"
-          cp nm-scan.sh "$MODPATH/nm-scan.sh"
+          cp module/nm-scan.sh "$MODPATH/nm-scan.sh"
           cp module/customize.sh "$MODPATH/customize.sh"
 
           . "$MODPATH/customize.sh"
