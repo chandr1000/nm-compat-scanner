@@ -96,17 +96,18 @@ jobs:
           EOF
 
           # module_internal_ops: file ops on module-internal paths.
-          # All system paths are under module directory variables — these are
+          # All partition paths are under module directory variables — these are
           # the CORRECT way to prepare OverlayFS content and must NOT be flagged.
-          # Tests both ${VAR} and $VAR styles, plus literal /data/adb/modules/ prefix.
+          # Covers all partitions in _NM_SYS_PARTS (system, vendor, product,
+          # system_ext, odm, mi_ext) using both ${VAR} and $VAR styles.
+          # Also includes a non-partition dir (zygisk/) that must NOT be treated
+          # as module-internal — though it wouldn't match any pattern anyway.
           cat > "$FIXTURE_ROOT/data/adb/modules/module_internal_ops/service.sh" <<'EOF'
           #!/system/bin/sh
           MODDIR=${0%/*}
           mod_dir="$MODDIR"
+          # system partition
           mkdir -p "${mod_dir}/system/etc/selinux"
-          mkdir -p "$MODDIR/vendor/lib"
-          cp "$MODDIR/staging/config.xml" "${mod_dir}/system/etc/config.xml"
-          mv /tmp/overlay_tmp "$MODDIR/product/overlay.img"
           chmod 755 "$MODDIR/system/bin/my_binary"
           chown root:shell "${mod_dir}/system/bin/my_binary"
           touch "$MODDIR/system/etc/marker"
@@ -115,6 +116,19 @@ jobs:
           sed -i 's/pattern/replace/' "$MODDIR/system/etc/config.xml"
           echo "data" > "$MODDIR/system/etc/data.txt"
           printf 'text' > "${mod_dir}/system/etc/text.txt"
+          # vendor partition
+          mkdir -p "$MODDIR/vendor/lib/hw"
+          cp "$MODDIR/staging/libfoo.so" "$MODDIR/vendor/lib/libfoo.so"
+          # product partition
+          mv /tmp/overlay_tmp "$MODDIR/product/overlay.img"
+          # system_ext partition
+          cp /tmp/ext_file "${mod_dir}/system_ext/etc/config.xml"
+          # odm partition
+          chmod 644 "$MODDIR/odm/etc/fstab"
+          # mi_ext partition (OEM-specific)
+          chcon u:object_r:system_file:s0 "$MODDIR/mi_ext/bin/app"
+          # Non-partition dir (zygisk) — just a sanity check, no pattern matches
+          cp "$MODDIR/zygisk/arm64/bin.so" "$MODDIR/zygisk/x86/bin.so"
           EOF
 
           # empty_module: no scripts at all

@@ -76,30 +76,52 @@ if [ -z "${TMPDIR:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# System partition names — SINGLE SOURCE OF TRUTH
+# ---------------------------------------------------------------------------
+# Used by both detection patterns and the false-positive filter.
+# Only names listed here are treated as partition-mimicking module
+# subdirectories.  Other dirs (e.g. x86 for zygisk, staging, etc.) are
+# never stripped by the filter, so they won't produce false negatives.
+#
+# To add a new OEM-specific partition (e.g. mi_ext, oppo_ext), append it
+# to the alternation below.  Both patterns and filter pick it up automatically.
+# ---------------------------------------------------------------------------
+_NM_SYS_PARTS='system|vendor|product|system_ext|odm|mi_ext'
+
+# Shorthand: ERE fragment for a word-boundary before a partition path.
+# Produces e.g. (^|[^[:alnum:]_/])/(system|vendor|...)/
+# The inner parentheses around \$_NM_SYS_PARTS are CRITICAL — without them
+# the ERE alternation would be unscoped and each partition name would
+# match any line containing that word (ERE | has lowest precedence).
+_nm_part_boundary="(^|[^[:alnum:]_/])/($_NM_SYS_PARTS)"
+
+# ---------------------------------------------------------------------------
 # Pattern definitions
 # Format: <id>~<severity>~<POSIX ERE>~<description>
 # Field separator is '~' (tilde) to avoid clashing with ERE '|'.
 # severity: HIGH | MED | LOW | INFO
 # ---------------------------------------------------------------------------
 _nm_patterns() {
-    cat <<'EOF'
+    # NOTE: heredoc uses EOF (not 'EOF') so $_NM_SYS_PARTS is expanded.
+    # None of the pattern text contains literal dollar signs, so this is safe.
+    cat <<EOF
 mount_bind~HIGH~(^|[[:space:]])mount[[:space:]]+.*--bind~Bind-mount over a path NM/ZM may also redirect (competing redirection)
 mount_overlay~HIGH~(^|[[:space:]])mount[[:space:]]+(-t[[:space:]]+)?overlay~OverlayFS mount - conflicts with NM/ZM VFS layer
-mount_remount_rw_system~HIGH~mount.*remount.*rw.*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)($|[^[:alnum:]_/])~Force-remount system partition rw - will fail/panic on protected kernels
+mount_remount_rw_system~HIGH~mount.*remount.*rw.*$_nm_part_boundary($|[^[:alnum:]_/])~Force-remount system partition rw - will fail/panic on protected kernels
 mount_remount_rw_generic~MED~mount.*-o.*remount.*rw~Any remount,rw attempt - review target
-mount_tmpfs_system~HIGH~mount.*-t[[:space:]]+tmpfs.*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~tmpfs over system path - competes with VFS layer
-chcon_system~HIGH~chcon[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~chcon on a real system path - label won't reach NM-redirected inode; use staging dir
-restorecon_system~MED~restorecon[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~restorecon on system path - similar to chcon; prefer staging
-sed_i_system~HIGH~sed[[:space:]]+.*-i.*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~sed -i on a live system path - breaks under NM (path is virtual, file is read-only)
-echo_redirect_system~MED~echo[[:space:]].*>[[:space:]]*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~echo redirect to system path - won't persist under NM
-printf_redirect_system~MED~printf[[:space:]].*>[[:space:]]*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~printf redirect to system path - won't persist under NM
-cp_to_system~MED~(^|[[:space:]])cp[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~cp targeting system path - should copy to module staging dir
-mv_to_system~MED~(^|[[:space:]])mv[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~mv targeting system path - should be done via module staging
-mkdir_system~MED~(^|[[:space:]])mkdir[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~mkdir on system path - should be done via module staging
-rm_system~MED~(^|[[:space:]])(rm|unlink)[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~rm/unlink on system path - read-only partition
-touch_system~LOW~(^|[[:space:]])touch[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~touch on system path - review
-chmod_system~LOW~(^|[[:space:]])chmod[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~chmod on system path - won't apply if NM is redirecting it
-chown_system~LOW~(^|[[:space:]])chown[[:space:]].*(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/~chown on system path - won't apply if NM is redirecting it
+mount_tmpfs_system~HIGH~mount.*-t[[:space:]]+tmpfs.*$_nm_part_boundary/~tmpfs over system path - competes with VFS layer
+chcon_system~HIGH~chcon[[:space:]].*$_nm_part_boundary/~chcon on a real system path - label won't reach NM-redirected inode; use staging dir
+restorecon_system~MED~restorecon[[:space:]].*$_nm_part_boundary/~restorecon on system path - similar to chcon; prefer staging
+sed_i_system~HIGH~sed[[:space:]]+.*-i.*$_nm_part_boundary/~sed -i on a live system path - breaks under NM (path is virtual, file is read-only)
+echo_redirect_system~MED~echo[[:space:]].*>[[:space:]]*$_nm_part_boundary/~echo redirect to system path - won't persist under NM
+printf_redirect_system~MED~printf[[:space:]].*>[[:space:]]*$_nm_part_boundary/~printf redirect to system path - won't persist under NM
+cp_to_system~MED~(^|[[:space:]])cp[[:space:]].*$_nm_part_boundary/~cp targeting system path - should copy to module staging dir
+mv_to_system~MED~(^|[[:space:]])mv[[:space:]].*$_nm_part_boundary/~mv targeting system path - should be done via module staging
+mkdir_system~MED~(^|[[:space:]])mkdir[[:space:]].*$_nm_part_boundary/~mkdir on system path - should be done via module staging
+rm_system~MED~(^|[[:space:]])(rm|unlink)[[:space:]].*$_nm_part_boundary/~rm/unlink on system path - read-only partition
+touch_system~LOW~(^|[[:space:]])touch[[:space:]].*$_nm_part_boundary/~touch on system path - review
+chmod_system~LOW~(^|[[:space:]])chmod[[:space:]].*$_nm_part_boundary/~chmod on system path - won't apply if NM is redirecting it
+chown_system~LOW~(^|[[:space:]])chown[[:space:]].*$_nm_part_boundary/~chown on system path - won't apply if NM is redirecting it
 nm_add_call~INFO~(^|[[:space:]])(nm|zeromount)[[:space:]]+add~Manual nm/zeromount add call - review whether it conflicts with ZeroMount's auto-scan
 EOF
 }
@@ -107,35 +129,40 @@ EOF
 # ---------------------------------------------------------------------------
 # False-positive filter for file-operation patterns.
 # ---------------------------------------------------------------------------
-# Per KernelSU/Magisk module convention, modules place files under a
-# $MODDIR/system/ (or /vendor, /product, /system_ext) subdirectory which
-# OverlayFS later mounts onto the real system.  Operations on those paths
-# are the CORRECT way to do systemless modifications and must NOT be
-# flagged.
+# Per KernelSU/Magisk module convention, modules may place files under
+# subdirectories named after system partitions (system/, vendor/,
+# product/, system_ext/, odm/, mi_ext/, etc.) which OverlayFS later
+# mounts onto the real partitions.  Operations on those paths are the
+# CORRECT way to do systemless modifications and must NOT be flagged.
+#
+# IMPORTANT: only partition names listed in _NM_SYS_PARTS are treated as
+# module-internal.  Non-partition dirs like x86 (zygisk), staging, etc.
+# are never stripped — they cannot produce false negatives.
 #
 # Strategy: strip module-internal path references from each matched line,
-# then keep only lines where a bare system path still remains.
+# then keep only lines where a bare partition path still remains.
 #
-# This correctly handles lines with BOTH module-internal and real system
-# paths (e.g. cp /system/file $MODDIR/backup/) — the real /system/ ref
-# survives stripping and the line is still flagged.
+# This correctly handles lines with BOTH module-internal and real
+# partition paths (e.g. cp /system/file $MODDIR/backup/) — the real
+# /system/ ref survives stripping and the line is still flagged.
 #
 # Patterns that need this filter: file operations (cp, mv, mkdir, rm,
 # touch, chmod, chown, chcon, restorecon, sed -i, echo>, printf>) where
-# the system path could be module-internal.
+# the partition path could be module-internal.
 #
 # Patterns that do NOT need this filter: mount operations (bind, overlay,
 # remount, tmpfs) — these are inherently system-level and cannot be
 # module-internal.
 # ---------------------------------------------------------------------------
 _nm_filter_safe_context() {
-    # Strip paths where /system /vendor /product /system_ext appear after
-    # a module directory variable ($VAR/ ${VAR}/) or /data/adb/modules/<id>/.
-    # Then keep only lines that still contain a bare system path reference.
+    # Strip paths where a partition name appears after a module directory
+    # variable ($VAR/ ${VAR}/) or /data/adb/modules/<id>/.  Uses the same
+    # _NM_SYS_PARTS list as the detection patterns for consistency.
+    # Then keep only lines that still contain a bare partition path.
     sed -E \
-        -e 's~\$[{]?[A-Za-z_][A-Za-z0-9_]*[}]?/(system|vendor|product|system_ext)/[^ "[:space:]]*~~g' \
-        -e 's~/data/adb/modules/[^/[:space:]]+/(system|vendor|product|system_ext)/[^ "[:space:]]*~~g' \
-    | grep -E '(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/'
+        -e "s~\\\$[{]?[A-Za-z_][A-Za-z0-9_]*[}]?/($_NM_SYS_PARTS)/[^ \"[:space:]]*~~g" \
+        -e "s~/data/adb/modules/[^/[:space:]]+/($_NM_SYS_PARTS)/[^ \"[:space:]]*~~g" \
+    | grep -E "(^|[^[:alnum:]_/])/($_NM_SYS_PARTS)/"
 }
 
 # ---------------------------------------------------------------------------
