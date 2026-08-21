@@ -7,6 +7,7 @@ name: Test
 #   3. Standalone mode returns exit code 0 when no conflicts are found
 #   4. Recovery rejection (BOOTMODE=false) aborts cleanly in sourced mode
 #   5. POSIX sh compatibility (runs under dash, not just bash)
+#   6. Module-internal file operations ($MODDIR/system/...) are not flagged
 #
 # Free for public repos (unlimited minutes).
 
@@ -44,7 +45,7 @@ jobs:
           # Create synthetic module fixtures under a temp /data/adb/modules-like
           # tree. Each fixture has a known set of conflict patterns.
           FIXTURE_ROOT="$HOME/fixtures"
-          mkdir -p "$FIXTURE_ROOT/data/adb/modules"/{good_module,systemless_ok,bind_mount_module,sed_chcon_module,remount_module,empty_module}
+          mkdir -p "$FIXTURE_ROOT/data/adb/modules"/{good_module,module_internal_ops,systemless_ok,bind_mount_module,sed_chcon_module,remount_module,empty_module}
 
           # good_module: uses staging dir, lets NM/ZM do the redirection
           cat > "$FIXTURE_ROOT/data/adb/modules/good_module/service.sh" <<'EOF'
@@ -94,6 +95,28 @@ jobs:
           nm add /system/bin/my_binary "$MODDIR/staging/my_binary"
           EOF
 
+          # module_internal_ops: file ops on module-internal paths.
+          # All system paths are under module directory variables — these are
+          # the CORRECT way to prepare OverlayFS content and must NOT be flagged.
+          # Tests both ${VAR} and $VAR styles, plus literal /data/adb/modules/ prefix.
+          cat > "$FIXTURE_ROOT/data/adb/modules/module_internal_ops/service.sh" <<'EOF'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          mod_dir="$MODDIR"
+          mkdir -p "${mod_dir}/system/etc/selinux"
+          mkdir -p "$MODDIR/vendor/lib"
+          cp "$MODDIR/staging/config.xml" "${mod_dir}/system/etc/config.xml"
+          mv /tmp/overlay_tmp "$MODDIR/product/overlay.img"
+          chmod 755 "$MODDIR/system/bin/my_binary"
+          chown root:shell "${mod_dir}/system/bin/my_binary"
+          touch "$MODDIR/system/etc/marker"
+          chcon u:object_r:system_file:s0 "$MODDIR/system/bin/my_binary"
+          restorecon -R "$MODDIR/system/bin/"
+          sed -i 's/pattern/replace/' "$MODDIR/system/etc/config.xml"
+          echo "data" > "$MODDIR/system/etc/data.txt"
+          printf 'text' > "${mod_dir}/system/etc/text.txt"
+          EOF
+
           # empty_module: no scripts at all
           mkdir -p "$FIXTURE_ROOT/data/adb/modules/empty_module"
 
@@ -127,6 +150,14 @@ jobs:
           # Verify good_module is NOT flagged (no conflict lines under its name)
           if grep -A1 "good_module" /tmp/scan_out.txt | grep -qE '^[[:space:]]+[X!\-+]'; then
             echo "::error::good_module should not have any conflicts, but flagged lines were found"
+            exit 1
+          fi
+
+          # Verify module_internal_ops is NOT flagged — all file ops are on
+          # module-internal paths ($MODDIR/system/..., ${mod_dir}/system/..., etc.)
+          if grep -A1 "module_internal_ops" /tmp/scan_out.txt | grep -qE '^[[:space:]]+[X!\-+]'; then
+            echo "::error::module_internal_ops should not have any conflicts (all paths are module-internal), but flagged lines were found"
+            cat /tmp/scan_out.txt
             exit 1
           fi
 

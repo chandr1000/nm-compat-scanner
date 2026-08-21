@@ -105,6 +105,40 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# False-positive filter for file-operation patterns.
+# ---------------------------------------------------------------------------
+# Per KernelSU/Magisk module convention, modules place files under a
+# $MODDIR/system/ (or /vendor, /product, /system_ext) subdirectory which
+# OverlayFS later mounts onto the real system.  Operations on those paths
+# are the CORRECT way to do systemless modifications and must NOT be
+# flagged.
+#
+# Strategy: strip module-internal path references from each matched line,
+# then keep only lines where a bare system path still remains.
+#
+# This correctly handles lines with BOTH module-internal and real system
+# paths (e.g. cp /system/file $MODDIR/backup/) — the real /system/ ref
+# survives stripping and the line is still flagged.
+#
+# Patterns that need this filter: file operations (cp, mv, mkdir, rm,
+# touch, chmod, chown, chcon, restorecon, sed -i, echo>, printf>) where
+# the system path could be module-internal.
+#
+# Patterns that do NOT need this filter: mount operations (bind, overlay,
+# remount, tmpfs) — these are inherently system-level and cannot be
+# module-internal.
+# ---------------------------------------------------------------------------
+_nm_filter_safe_context() {
+    # Strip paths where /system /vendor /product /system_ext appear after
+    # a module directory variable ($VAR/ ${VAR}/) or /data/adb/modules/<id>/.
+    # Then keep only lines that still contain a bare system path reference.
+    sed -E \
+        -e 's~\$[{]?[A-Za-z_][A-Za-z0-9_]*[}]?/(system|vendor|product|system_ext)/[^ "[:space:]]*~~g' \
+        -e 's~/data/adb/modules/[^/[:space:]]+/(system|vendor|product|system_ext)/[^ "[:space:]]*~~g' \
+    | grep -E '(^|[^[:alnum:]_/])(/system|/vendor|/product|/system_ext)/'
+}
+
+# ---------------------------------------------------------------------------
 # Main scanner function. Call with: nm_scan_main [modules_dir]
 # Sets: nm_scan_exit_code (0=clean, 1=preflight error, 2=conflicts found)
 # ---------------------------------------------------------------------------
@@ -210,6 +244,18 @@ nm_scan_main() {
                 _matches=$(grep -nE -- "$_regex" "$_script" 2>/dev/null)
             else
                 _matches=$(grep -E -- "$_regex" "$_script" 2>/dev/null | sed 's/^/?: /')
+            fi
+
+            # Filter false positives for file-operation patterns where the
+            # system path may be module-internal ($MODDIR/system/... etc.)
+            # instead of a real system path.  Mount patterns are excluded —
+            # they are inherently system-level operations.
+            if [ -n "$_matches" ]; then
+                case "$_pid" in
+                    chcon_system|restorecon_system|sed_i_system|echo_redirect_system|printf_redirect_system|cp_to_system|mv_to_system|mkdir_system|rm_system|touch_system|chmod_system|chown_system)
+                        _matches=$(printf '%s\n' "$_matches" | _nm_filter_safe_context)
+                        ;;
+                esac
             fi
 
             if [ -n "$_matches" ]; then
